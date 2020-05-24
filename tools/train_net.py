@@ -232,6 +232,11 @@ def main(args):
 if __name__ == "__main__":
     args = default_argument_parser().parse_args()
     print("Command Line Args:", args)
+
+    if args.num_gpus == 1:
+        import os
+        os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+
     launch(
         main,
         args.num_gpus,

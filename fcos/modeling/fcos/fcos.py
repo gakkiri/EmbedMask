@@ -48,7 +48,7 @@ class FCOS(nn.Module):
         self.post_nms_topk_train  = cfg.MODEL.FCOS.POST_NMS_TOPK_TRAIN
         self.post_nms_topk_test   = cfg.MODEL.FCOS.POST_NMS_TOPK_TEST
         self.thresh_with_ctr      = cfg.MODEL.FCOS.THRESH_WITH_CTR
-        self.num_protos = 32#cfg.MODEL.YOLACT.NUM_PROTOS
+        self.embed_dim = 64
         # fmt: on
         self.iou_loss = IOULoss(cfg.MODEL.FCOS.LOC_LOSS_TYPE)
         # generate sizes of interest
@@ -76,7 +76,8 @@ class FCOS(nn.Module):
         """
         features = [features[f] for f in self.in_features]
         locations = self.compute_locations(features)
-        logits_pred, reg_pred, ctrness_pred, bbox_towers, coeffs, protos = self.fcos_head(features)
+        logits_pred, reg_pred, ctrness_pred, bbox_towers, proposal_embeds, pixel_embed, margins \
+            = self.fcos_head(features)
 
         if self.training:
             pre_nms_thresh = self.pre_nms_thresh_train
@@ -106,9 +107,10 @@ class FCOS(nn.Module):
             self.nms_thresh,
             post_nms_topk,
             self.thresh_with_ctr,
-            coeffs,
-            protos,
-            self.num_protos,
+            proposal_embeds,
+            pixel_embed,
+            margins,
+            self.embed_dim,
             gt_instances
         )
 
@@ -156,14 +158,14 @@ class FCOSHead(nn.Module):
         # TODO: Implement the sigmoid version first.
         self.num_classes = cfg.MODEL.FCOS.NUM_CLASSES
         self.fpn_strides = cfg.MODEL.FCOS.FPN_STRIDES
-        self.num_protos = 32
+        self.embed_dim = 64
         head_configs = {"cls": (cfg.MODEL.FCOS.NUM_CLS_CONVS,
                                 False),
                         "bbox": (cfg.MODEL.FCOS.NUM_BOX_CONVS,
                                  cfg.MODEL.FCOS.USE_DEFORMABLE),
                         "share": (cfg.MODEL.FCOS.NUM_SHARE_CONVS,
                                   cfg.MODEL.FCOS.USE_DEFORMABLE),
-                        "proto": (self.num_protos, False)
+                        "pixel_embed": (4, False)
                         }
         norm = None if cfg.MODEL.FCOS.NORM == "none" else cfg.MODEL.FCOS.NORM
 
@@ -203,14 +205,22 @@ class FCOSHead(nn.Module):
             in_channels, 1, kernel_size=3,
             stride=1, padding=1
         )
-        self.proto = nn.Conv2d(
-            in_channels, self.num_protos, kernel_size=3,
+        ### EMBEDMASK ###
+        self.pixel_embed = nn.Conv2d(
+            in_channels, self.embed_dim, kernel_size=3,
             stride=1, padding=1
         )
-        self.coeff = nn.Conv2d(
-            in_channels, self.num_protos, kernel_size=3,
+        self.proposal_embed = nn.Conv2d(
+            in_channels, self.embed_dim, kernel_size=3,
             stride=1, padding=1
         )
+        torch.nn.init.normal_(self.proposal_embed.weight, std=0.01)
+        torch.nn.init.constant_(self.proposal_embed.bias, 0)
+        self.margin = nn.Conv2d(
+            4, 1, kernel_size=1, stride=1
+        )
+        torch.nn.init.normal_(self.margin.weight, std=0.01)
+        torch.nn.init.constant_(self.margin.bias, math.log(-math.log(0.5) / (2 ** 2)))
 
         if cfg.MODEL.FCOS.USE_SCALE:
             self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in self.fpn_strides])
@@ -221,7 +231,7 @@ class FCOSHead(nn.Module):
             self.cls_tower, self.bbox_tower,
             self.share_tower, self.cls_logits,
             self.bbox_pred, self.ctrness,
-            self.proto, self.coeff
+            self.pixel_embed
         ]:
             for l in modules.modules():
                 if isinstance(l, nn.Conv2d):
@@ -238,7 +248,8 @@ class FCOSHead(nn.Module):
         bbox_reg = []
         ctrness = []
         bbox_towers = []
-        coeffs=[]
+        proposal_embeds = []
+        margins = []
         for l, feature in enumerate(x):
             feature = self.share_tower(feature)
             cls_tower = self.cls_tower(feature)
@@ -251,10 +262,13 @@ class FCOSHead(nn.Module):
                 reg = self.scales[l](reg)
             # Note that we use relu, as in the improved FCOS, instead of exp.
             bbox_reg.append(F.relu(reg))
-            coeffs.append(torch.tanh(self.coeff(bbox_tower)))
+            proposal_embeds.append(self.proposal_embed(bbox_tower))
 
-        proto_x = x[0]
-        proto_x = self.proto_tower(proto_x)
-        protos = self.proto(proto_x)
+            margin_x = (bbox_reg[-1] * self.fpn_strides[l] / 800)  # todo self.box_to_margin_scale = 800
+            margins.append(torch.exp(self.margin(margin_x)))
+
+        _x = x[0]
+        pixel_embed_x = self.pixel_embed_tower(_x)
+        pixel_embed = self.pixel_embed(pixel_embed_x)
           
-        return logits, bbox_reg, ctrness, bbox_towers, coeffs, protos
+        return logits, bbox_reg, ctrness, bbox_towers, proposal_embeds, pixel_embed, margins
