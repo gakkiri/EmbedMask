@@ -39,6 +39,6 @@ python train_net.py --num-gpus 8 --config-file configs/EmbedMask/MS_R_101_3x.yam
 Trained model can be download in https://drive.google.com/file/d/1dQ7ef_ArV1LiUk7LovxSKImYecNu5Jmr/view?usp=sharing
 
 ## Results
-I trained about 10 epoch using the resnet-101 backbone, a V100 takes about 2 days.  
+I trained about 10 epochs using the resnet-101 backbone, a V100 takes about 2 days.  
 ![box](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/bbox_ap.png?x-oss-Process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzNDk3ODQ1,size_16,color_FFFFFF,t_70)
 ![box](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/seg_ap.png?x-oss-Process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzNDk3ODQ1,size_16,color_FFFFFF,t_70)
