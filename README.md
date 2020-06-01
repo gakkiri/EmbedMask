@@ -5,8 +5,8 @@ arxiv:  https://arxiv.org/abs/1912.01954
   
 # Want to say
 The performance is not very stable at present.  
-In the inference phase, in RES_R_50_2x.yaml, box AP 34% and seg AP 29% were reached after a brief training.  
-Under the same number of iterations, RES_R_101_3x.yaml gets box AP 37%, while seg AP is only 24%.  
+In the inference phase, in MS_R_50_2x.yaml, box AP 34% and seg AP 29% were reached after a brief training.  
+Under the same number of iterations, MS_X_101_3x.yaml gets box AP 37%, while seg AP is only 24%.  
 [Here](https://github.com/gakkiri/EmbedMask/blob/master/fcos/modeling/fcos/fcos_outputs.py#L363) I use the CPU implementation, so the FPS is low.  
 
 ## Install
