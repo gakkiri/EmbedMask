@@ -2,14 +2,14 @@ import logging
 import torch.nn.functional as F
 
 from detectron2.layers import cat
-from detectron2.structures import Instances, Boxes, pairwise_iou  #
+from detectron2.structures import Instances, Boxes  #
 from fcos.utils.comm import get_world_size
 from fvcore.nn import sigmoid_focal_loss_jit
 
 from fcos.utils.comm import reduce_sum
 from fcos.layers import ml_nms
 from .utils import *
-from .lovasz import LovaszHinge
+from fcos.layers.lovasz import LovaszHinge
 
 from detectron2.layers import interpolate
 
@@ -292,17 +292,6 @@ class FCOSOutputs(object):
                 x.reshape(-1, 4) for x in reg_targets
             ], dim=0, )
 
-        # proposal_embed_pred = cat(
-        #     [
-        #         # (N, Hi, Wi, dim) -> (N*Hi*Wi, dim)
-        #         x.permute(0, 2, 3, 1).reshape(-1, self.embed_dim) for x in self.proposal_embeds
-        #     ], dim=0, )
-        # margin_pred = cat(
-        #     [
-        #         # (N, Hi, Wi, 1) -> (N*Hi*Wi, 1)
-        #         x.permute(0, 2, 3, 1).reshape(-1, 1) for x in self.margins
-        #     ], dim=0, )
-
         # (N, Hi, Wi, ?) -> (N, Hi*Wi, ?), List
         N = self.proposal_embeds[0].size(0)
         proposal_embed_pred = [x.permute(0, 2, 3, 1).reshape(N, -1, self.embed_dim) for x in self.proposal_embeds]
@@ -310,10 +299,12 @@ class FCOSOutputs(object):
         # (N, H_0, W_0, 1) -> (N, H_0*W_0, dim)
         # pixel_embed = self.pixel_embed.permute(0, 2, 3, 1).reshape(N, -1, self.embed_dim)
 
+        self.matched_idxes = matched_idxes
         matched_idxes = cat(
             [
                 x.reshape(-1) for x in matched_idxes
             ], dim=0, )
+
         im_idxes = cat(
             [
                 x.reshape(-1) for x in im_idxes
@@ -332,6 +323,8 @@ class FCOSOutputs(object):
             self.focal_loss_gamma,
             self.iou_loss,
             matched_idxes,
+            im_idxes,
+            self.gt_instances
         )
 
     def predict_proposals(self):
@@ -367,31 +360,12 @@ class FCOSOutputs(object):
 
         return boxlists
 
-    def compute_mask_prob(self, pixel_embed, proposal_embed, margins):
-        '''
-        :param pixel_embed: [dim, H, W]
-        :param proposal_embed: [n, dim]
-        :param margins: [n, 1]
-        :return:
-        '''
-        dim, m_h, m_w = pixel_embed.shape
-        margins = margins.view(-1, 1)
-        n = margins.size(0)
-        # -> (n, H0*W0, dim)
-        pixel_embed = pixel_embed.view(dim, m_h * m_w).permute(1, 0).unsqueeze(0).repeat(n, 1, 1)
-        # -> (n, 1, dim)
-        proposal_embed = proposal_embed.unsqueeze(1)
-
-        mask_var = torch.sum((pixel_embed - proposal_embed) ** 2, dim=2)  # (n, H0*W0)
-        mask_prob = torch.exp(-mask_var * margins)
-
-        return mask_prob.view(1, n, m_h, m_w)
-
     def forward_for_mask(self, boxlists):
         N, dim, m_h, m_w = self.pixel_embed.shape
         o_h = int(m_h * self.strides[0])
         o_w = int(m_w * self.strides[0])
         stride = self.strides[0] / self.mask_scale_factor
+        pixel_embed = interpolate(self.pixel_embed, scale_factor=self.mask_scale_factor, mode='bilinear', align_corners=False)
         for im in range(N):
             boxlist = boxlists[im]
             input_h, input_w = boxlist.image_size
@@ -401,10 +375,11 @@ class FCOSOutputs(object):
                 continue
 
             mask_boxes = boxlist.pred_boxes.tensor / stride
-            box_masks = boxes_to_masks(mask_boxes, m_h, m_w)
+            box_masks = boxes_to_masks(mask_boxes, m_h * self.mask_scale_factor, m_w * self.mask_scale_factor)
             margins = boxlist.margins
-            mask_prob = self.compute_mask_prob(self.pixel_embed[im], proposal_embed, margins)
-            masks = mask_prob * box_masks.float()
+            mask_prob = compute_mask_prob(proposal_embed, margins, pixel_embed[im])
+            mask_prob = mask_prob * box_masks.float()  # [n, m_h, m_w]
+            masks = mask_prob.unsqueeze(0)
             masks = interpolate(masks, size=(o_h, o_w), mode='bilinear', align_corners=False)
             masks = masks[:, :, :input_h, :input_w].permute(1, 0, 2, 3)
             boxlist.pred_masks = masks
@@ -512,79 +487,61 @@ class FCOSOutputs(object):
             results.append(result)
         return results
 
-    def get_pos_proposal_indexes(self, reg_pred, matched_idxes, targets,
-                                 sample_pos_iou_th=0.5):
+    def get_pos_proposal_indexes(self, matched_idxes, im_idxes, targets):
+        box_regression = self.reg_pred
         locations = torch.cat(self.locations, dim=0)
-        N = self.pixel_embed.size(0)
-        reg_pred = reg_pred.view(N, -1, 4)  # (N*sum[Hi*Wi, 0<i<fpn_layer], 4) -> (N, ..., 4)
-        matched_idxes = matched_idxes.view(N, -1)
-
         pos_indexes_for_targets = []
-        for im_i in range(N):
-            targets_per_im = targets[im_i]
-            regr = reg_pred[im_i]
-            pos_indexes_for_targets_per_im = []
-            for t_id in range(len(targets[im_i])):
-                valid = matched_idxes[im_i] == t_id
+        for im in range(len(targets)):
+            pos_indexes_for_targets_per_im = locations.new_ones(len(targets[im])).long() * -1
+            box_regression_im = [
+                box_regression[l][im].detach().view(4, -1).transpose(0, 1).contiguous() * self.strides[l] for l in
+                range(len(box_regression))]
+            box_regression_im = torch.cat(box_regression_im, dim=0)
+            for t_id in range(len(targets[im])):
+                valid = matched_idxes[im_idxes == im] == t_id
                 if valid.sum() == 0:
-                    pos_indexes_for_targets_per_im.append(valid.new_tensor([]))
                     continue
+
                 valid_location = locations[valid]
-                valid_regression = regr[valid]
-                detections = torch.stack([  # xyxy
+                valid_regression = box_regression_im[valid]
+                detections = torch.stack([
                     valid_location[:, 0] - valid_regression[:, 0],
                     valid_location[:, 1] - valid_regression[:, 1],
                     valid_location[:, 0] + valid_regression[:, 2],
                     valid_location[:, 1] + valid_regression[:, 3],
                 ], dim=1)
-                target = targets_per_im.gt_boxes[t_id:t_id + 1].tensor
+                target = targets[im].gt_boxes[t_id:t_id + 1].tensor
 
                 match_quality_matrix = iou(detections, target)
                 pos_labels_per_target = torch.zeros_like(valid)
                 iou_in_target = match_quality_matrix[:, 0]
-                if iou_in_target.max() > sample_pos_iou_th:
-                    pos_in_target = (iou_in_target > sample_pos_iou_th)
-                else:
-                    pos_in_target = (iou_in_target == iou_in_target.max())
+                pos_in_target = (iou_in_target == iou_in_target.max())
                 pos_labels_per_target[valid] = pos_in_target
+                pos_indexes_for_targets_per_im[t_id] = pos_labels_per_target.nonzero()[0][0]
 
-                pos_indexes_for_targets_per_im.append(pos_labels_per_target.nonzero().squeeze(1))
             pos_indexes_for_targets.append(pos_indexes_for_targets_per_im)
 
         return pos_indexes_for_targets
 
     def get_proposal_element(self, features, poses):
         N, _, dim = features[0].shape
-        features_flatten = torch.cat(features, dim=1).contiguous()
-        pos_features_for_targets = []
+        # features_flatten = torch.cat(
+        #     [features_per_level.view(N, dim, -1) for features_per_level in features], dim=2
+        # ).transpose(1, 2).contiguous()  # (N, -1, dim)
+        features_flatten = torch.cat(features, dim=1)
+        pos_features = []
+        pos_valids = []
         for im in range(N):
-            pos_features_for_targets_im = []
-            for t_id in range(len(poses[im])):
-                if len(poses[im][t_id]) == 0:
-                    pos_features_for_targets_im.append(features_flatten.new_tensor([]))
-                else:
-                    pos_features_for_targets_im.append(features_flatten[im][poses[im][t_id]])  # [num, dim]
-            pos_features_for_targets.append(pos_features_for_targets_im)
-        return pos_features_for_targets
-
-    def calculate_means(self, features):
-        means = []
-        for im in range(len(features)):
-            means_im = []
-            for t_id in range(len(features[im])):
-                if len(features[im][t_id]) == 0:
-                    means_im.append(features[im][t_id])
-                else:
-                    means_im.append(features[im][t_id].mean(dim=0).unsqueeze(0))  # [1, dim]
-            means.append(means_im)
-        return means
+            pos_features.append(features_flatten[im][poses[im]])
+            pos_valids.append(poses[im] != -1)
+        return pos_features, pos_valids
 
     def fcos_losses(
             self,
             labels,
             reg_targets,
             logits_pred,
-            _reg_pred,
+            reg_pred,
             ctrness_pred,
 
             proposal_embed,  # [(N, Hi*Wi, dim)]
@@ -594,7 +551,12 @@ class FCOSOutputs(object):
             focal_loss_gamma,
             iou_loss,
             matched_idxes,
+            im_idxes,
+            targets
     ):
+        targets_masks = [target_im.gt_masks.tensor for target_im in targets]
+        targets_boxes = [target_im.gt_boxes.tensor for target_im in targets]
+
         num_classes = logits_pred.size(1)
         labels = labels.flatten()
 
@@ -616,7 +578,7 @@ class FCOSOutputs(object):
             reduction="sum",
         ) / num_pos_avg
 
-        reg_pred = _reg_pred[pos_inds]
+        reg_pred = reg_pred[pos_inds]
         reg_targets = reg_targets[pos_inds]
         ctrness_pred = ctrness_pred[pos_inds]
 
@@ -637,27 +599,12 @@ class FCOSOutputs(object):
         ) / num_pos_avg
 
         # for embed mask
-        pos_proposal_labels_for_targets = self.get_pos_proposal_indexes(_reg_pred, matched_idxes, self.gt_instances)
+        pos_proposal_labels_for_targets = self.get_pos_proposal_indexes(matched_idxes, im_idxes, targets)
+        proposal_embed_for_targets, valids_for_targets = \
+            self.get_proposal_element(proposal_embed, pos_proposal_labels_for_targets)
+        proposal_margin_for_targets, _ = self.get_proposal_element(proposal_margin, pos_proposal_labels_for_targets)
 
-        proposal_embed_for_targets = self.get_proposal_element(proposal_embed, pos_proposal_labels_for_targets)
-        proposal_margin_for_targets = self.get_proposal_element(proposal_margin, pos_proposal_labels_for_targets)
-
-        embedding_means = self.calculate_means(proposal_embed_for_targets)
-        margin_means = self.calculate_means(proposal_margin_for_targets)
-
-        # smooth loss
         N, dim, m_h, m_w = self.pixel_embed.shape
-        smooth_loss = logits_pred.new_tensor(0.)
-        for im in range(N):
-            target_num = len(proposal_embed_for_targets[im])
-            smooth_loss_im = logits_pred.new_tensor(0.0)
-            for t_id in range(target_num):
-                smooth_loss_im += \
-                    torch.sum((proposal_embed_for_targets[im][t_id] - embedding_means[im][t_id]) ** 2) + \
-                    torch.sum((proposal_margin_for_targets[im][t_id] - margin_means[im][t_id]) ** 2)
-            if target_num > 0:
-                smooth_loss += smooth_loss_im / target_num
-        smooth_loss = smooth_loss / N * self.loss_smooth_alpha
         # mask loss
         o_h = m_h * self.mask_scale_factor
         o_w = m_w * self.mask_scale_factor
@@ -665,31 +612,28 @@ class FCOSOutputs(object):
         r_w = int(m_w * self.strides[0])
         stride = self.strides[0] / self.mask_scale_factor
 
-        targets_masks = [target_im.gt_masks.tensor for target_im in self.gt_instances]
-        targets_boxes = [target_im.gt_boxes.tensor for target_im in self.gt_instances]
         masks_t = prepare_masks(o_h, o_w, r_h, r_w, targets_masks)
         pixel_embed = interpolate(input=self.pixel_embed, size=(o_h, o_w), mode="bilinear", align_corners=False)
 
         mask_loss = logits_pred.new_tensor(0.0)
         for im in range(N):
-            mask_loss_im = logits_pred.new_tensor(0.0)
-            target_num = len(proposal_embed_for_targets[im])
-            for t_id in range(target_num):
-                if len(embedding_means[im][t_id]) == 0:
-                    continue
-                masks_prob = compute_mask_prob(embedding_means[im][t_id],
-                                               margin_means[im][t_id],
-                                               pixel_embed[im])
-                sample_num = len(masks_prob)
-                masks_t_id = masks_t[im][t_id]
-                boxes_t_id = targets_boxes[im][t_id] / stride
-                masks_prob_crop, crop_mask = crop_by_box(masks_prob, boxes_t_id)
-                mask_loss_per_target = self.mask_loss_func(masks_prob_crop,
-                                                           masks_t_id.unsqueeze(0).expand(sample_num, -1, -1).float(),
-                                                           mask=crop_mask, act=True)
-                mask_loss_im += mask_loss_per_target.mean()
-            if target_num > 0:
-                mask_loss += mask_loss_im / target_num
+            valid = valids_for_targets[im]
+            if valid.sum() == 0:
+                continue
+
+            proposal_embed_im = proposal_embed_for_targets[im][valid]
+            proposal_margin_im = proposal_margin_for_targets[im][valid]
+            masks_t_im = masks_t[im][valid]
+            boxes_t_im = targets_boxes[im][valid] / stride
+
+            masks_prob = compute_mask_prob(proposal_embed_im,
+                                           proposal_margin_im,
+                                           pixel_embed[im])
+
+            masks_prob_crop, crop_mask = crop_by_box(masks_prob, boxes_t_im)
+            mask_loss_per_target = self.mask_loss_func(masks_prob_crop, masks_t_im.float(), mask=crop_mask, act=True)
+
+            mask_loss += mask_loss_per_target.mean()
         mask_loss = mask_loss / N * self.loss_mask_alpha
 
         losses = {
@@ -697,6 +641,5 @@ class FCOSOutputs(object):
             "loss_fcos_loc": reg_loss,
             "loss_fcos_ctr": ctrness_loss,
             "loss_mask": mask_loss,
-            'loss_smooth': smooth_loss,
         }
         return losses, {}
