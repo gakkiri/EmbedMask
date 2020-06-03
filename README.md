@@ -3,13 +3,12 @@ Unofficial implementation for EmbedMask instance segmentation
 office: https://github.com/yinghdb/EmbedMask  
 arxiv:  https://arxiv.org/abs/1912.01954  
   
-# Log
-## 2020/6/3   
+## Log
+#### 2020/6/3   
 |config|bbox|mask|weight|
 |-|:-:|-:|-:|
 |MS_R_50_2x.yaml|40.399|34.105|[google drive](https://drive.google.com/file/d/18p5s2NCZwbBNzZnUmfovF9RM1hzxlEX4/view?usp=sharing)|
-
-## ...
+#### ...
 The performance is not very stable at present.  
 **MS_R_50_2x.yaml**, **box AP 34%** and **seg AP 28%** were reached after a brief training.  
 Under the same number of iterations, **MS_X_101_3x.yaml** gets **box AP 37%**, while **seg AP is only 24%**.  
