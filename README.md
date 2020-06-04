@@ -49,6 +49,10 @@ python train_net.py --num-gpus 8 --config-file configs/EmbedMask/MS_R_101_3x.yam
 #### MS_R_50_2x.yaml  
 ![box](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/box50.png?x-oss-Process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzNDk3ODQ1,size_16,color_FFFFFF,t_70)
 ![seg](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/mask50.png?x-oss-Process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzNDk3ODQ1,size_16,color_FFFFFF,t_70)  
+#### visualization
+![.](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/v1.png)
+![.](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/v2.png)
+![.](https://raw.githubusercontent.com/gakkiri/EmbedMask/master/img/v3.png)
 
 ## history
 I trained about 10 epochs, a V100 takes about 2 days.  
